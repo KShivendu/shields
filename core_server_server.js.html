@@ -26,31 +26,29 @@
     
     <section>
         <article>
-            <pre class="prettyprint source linenums"><code>'use strict'
-/**
+            <pre class="prettyprint source linenums"><code>/**
  * @module
  */
 
-const path = require('path')
-const url = require('url')
-const { bootstrap } = require('global-agent')
+import path from 'path'
+import url, { fileURLToPath } from 'url'
+import { bootstrap } from 'global-agent'
+import cloudflareMiddleware from 'cloudflare-middleware'
+import Camp from '@shields_io/camp'
+import originalJoi from 'joi'
+import makeBadge from '../../badge-maker/lib/make-badge.js'
+import GithubConstellation from '../../services/github/github-constellation.js'
+import LibrariesIoConstellation from '../../services/librariesio/librariesio-constellation.js'
+import { loadServiceClasses } from '../base-service/loader.js'
+import { makeSend } from '../base-service/legacy-result-sender.js'
+import { handleRequest } from '../base-service/legacy-request-handler.js'
+import { clearResourceCache } from '../base-service/resource-cache.js'
+import { rasterRedirectUrl } from '../badge-urls/make-badge-url.js'
+import { fileSize, nonNegativeInteger } from '../../services/validators.js'
+import log from './log.js'
+import PrometheusMetrics from './prometheus-metrics.js'
+import InfluxMetrics from './influx-metrics.js'
 const { URL } = url
-const cloudflareMiddleware = require('cloudflare-middleware')
-const bytes = require('bytes')
-const Camp = require('@shields_io/camp')
-const originalJoi = require('joi')
-const makeBadge = require('../../badge-maker/lib/make-badge')
-const GithubConstellation = require('../../services/github/github-constellation')
-const suggest = require('../../services/suggest')
-const { loadServiceClasses } = require('../base-service/loader')
-const { makeSend } = require('../base-service/legacy-result-sender')
-const { handleRequest } = require('../base-service/legacy-request-handler')
-const { clearRegularUpdateCache } = require('../legacy/regular-update')
-const { rasterRedirectUrl } = require('../badge-urls/make-badge-url')
-const log = require('./log')
-const sysMonitor = require('./monitor')
-const PrometheusMetrics = require('./prometheus-metrics')
-const InfluxMetrics = require('./influx-metrics')
 
 const Joi = originalJoi
   .extend(base => ({
@@ -95,11 +93,11 @@ const publicConfigSchema = Joi.object({
   bind: {
     port: Joi.alternatives().try(
       Joi.number().port(),
-      Joi.string().pattern(/^\\\\\.\\pipe\\.+$/)
+      Joi.string().pattern(/^\\\\\.\\pipe\\.+$/),
     ),
     address: Joi.alternatives().try(
       Joi.string().ip().required(),
-      Joi.string().hostname().required()
+      Joi.string().hostname().required(),
     ),
   },
   metrics: {
@@ -142,6 +140,9 @@ const publicConfigSchema = Joi.object({
   redirectUrl: optionalUrl,
   rasterUrl: optionalUrl,
   cors: {
+    // This doesn't actually do anything
+    // TODO: maybe remove in future?
+    // https://github.com/badges/shields/pull/8311#discussion_r945337530
     allowedOrigin: Joi.array().items(optionalUrl).required(),
   },
   services: Joi.object({
@@ -153,7 +154,9 @@ const publicConfigSchema = Joi.object({
         enabled: Joi.boolean().required(),
         intervalSeconds: Joi.number().integer().min(1).required(),
       },
+      restApiVersion: Joi.date().raw().required(),
     },
+    gitlab: defaultService,
     jira: defaultService,
     jenkins: Joi.object({
       authorizedOrigins: origins,
@@ -162,46 +165,58 @@ const publicConfigSchema = Joi.object({
     }).default({ authorizedOrigins: [] }),
     nexus: defaultService,
     npm: defaultService,
+    obs: defaultService,
     sonar: defaultService,
     teamcity: defaultService,
+    weblate: defaultService,
     trace: Joi.boolean().required(),
   }).required(),
-  cacheHeaders: {
-    defaultCacheLengthSeconds: Joi.number().integer().required(),
-  },
-  rateLimit: Joi.boolean().required(),
+  cacheHeaders: { defaultCacheLengthSeconds: nonNegativeInteger },
   handleInternalErrors: Joi.boolean().required(),
-  fetchLimit: Joi.string().regex(/^[0-9]+(b|kb|mb|gb|tb)$/i),
+  fetchLimit: fileSize,
+  userAgentBase: Joi.string().required(),
+  requestTimeoutSeconds: nonNegativeInteger,
+  requestTimeoutMaxAgeSeconds: nonNegativeInteger,
   documentRoot: Joi.string().default(
-    path.resolve(__dirname, '..', '..', 'public')
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '..',
+      '..',
+      'public',
+    ),
   ),
   requireCloudflare: Joi.boolean().required(),
 }).required()
 
 const privateConfigSchema = Joi.object({
   azure_devops_token: Joi.string(),
-  bintray_user: Joi.string(),
-  bintray_apikey: Joi.string(),
   discord_bot_token: Joi.string(),
   drone_token: Joi.string(),
   gh_client_id: Joi.string(),
   gh_client_secret: Joi.string(),
   gh_token: Joi.string(),
+  gitlab_token: Joi.string(),
   jenkins_user: Joi.string(),
   jenkins_pass: Joi.string(),
   jira_user: Joi.string(),
   jira_pass: Joi.string(),
+  bitbucket_username: Joi.string(),
+  bitbucket_password: Joi.string(),
   bitbucket_server_username: Joi.string(),
   bitbucket_server_password: Joi.string(),
+  librariesio_tokens: Joi.arrayFromString().items(Joi.string()),
   nexus_user: Joi.string(),
   nexus_pass: Joi.string(),
   npm_token: Joi.string(),
+  obs_user: Joi.string(),
+  obs_pass: Joi.string(),
   redis_url: Joi.string().uri({ scheme: ['redis', 'rediss'] }),
+  postgres_url: Joi.string().uri({ scheme: 'postgresql' }),
   sentry_dsn: Joi.string(),
-  shields_secret: Joi.string(),
   sl_insight_userUuid: Joi.string(),
   sl_insight_apiToken: Joi.string(),
   sonarqube_token: Joi.string(),
+  stackapps_api_key: Joi.string(),
   teamcity_user: Joi.string(),
   teamcity_pass: Joi.string(),
   twitch_client_id: Joi.string(),
@@ -209,6 +224,7 @@ const privateConfigSchema = Joi.object({
   wheelmap_token: Joi.string(),
   influx_username: Joi.string(),
   influx_password: Joi.string(),
+  weblate_api_key: Joi.string(),
   youtube_api_key: Joi.string(),
 }).required()
 const privateMetricsInfluxConfigSchema = privateConfigSchema.append({
@@ -218,6 +234,14 @@ const privateMetricsInfluxConfigSchema = privateConfigSchema.append({
 
 function addHandlerAtIndex(camp, index, handlerFn) {
   camp.stack.splice(index, 0, handlerFn)
+}
+
+function isOnHeroku() {
+  return !!process.env.DYNO
+}
+
+function isOnFly() {
+  return !!process.env.FLY_APP_NAME
 }
 
 /**
@@ -240,7 +264,7 @@ class Server {
     const publicConfig = Joi.attempt(config.public, publicConfigSchema)
     const privateConfig = this.validatePrivateConfig(
       config.private,
-      privateConfigSchema
+      privateConfigSchema,
     )
     // We want to require an username and a password for the influx metrics
     // only if the influx metrics are enabled. The private config schema
@@ -249,7 +273,7 @@ class Server {
     if (publicConfig.metrics.influx &amp;&amp; publicConfig.metrics.influx.enabled) {
       this.validatePrivateConfig(
         config.private,
-        privateMetricsInfluxConfigSchema
+        privateMetricsInfluxConfigSchema,
       )
     }
     this.config = {
@@ -262,6 +286,10 @@ class Server {
       private: privateConfig,
     })
 
+    this.librariesioConstellation = new LibrariesIoConstellation({
+      private: privateConfig,
+    })
+
     if (publicConfig.metrics.prometheus.enabled) {
       this.metricInstance = new PrometheusMetrics()
       if (publicConfig.metrics.influx.enabled) {
@@ -270,7 +298,7 @@ class Server {
           Object.assign({}, publicConfig.metrics.influx, {
             username: privateConfig.influx_username,
             password: privateConfig.influx_password,
-          })
+          }),
         )
       }
     }
@@ -283,8 +311,8 @@ class Server {
       const badPaths = e.details.map(({ path }) => path)
       throw Error(
         `Private configuration is invalid. Check these paths: ${badPaths.join(
-          ','
-        )}`
+          ',',
+        )}`,
       )
     }
   }
@@ -316,13 +344,21 @@ class Server {
     // Set `req.ip`, which is expected by `cloudflareMiddleware()`. This is set
     // by Express but not Scoutcamp.
     addHandlerAtIndex(this.camp, 0, function (req, res, next) {
-      // On Heroku, `req.socket.remoteAddress` is the Heroku router. However,
-      // the router ensures that the last item in the `X-Forwarded-For` header
-      // is the real origin.
-      // https://stackoverflow.com/a/18517550/893113
-      req.ip = process.env.DYNO
-        ? req.headers['x-forwarded-for'].split(', ').pop()
-        : req.socket.remoteAddress
+      if (isOnHeroku()) {
+        // On Heroku, `req.socket.remoteAddress` is the Heroku router. However,
+        // the router ensures that the last item in the `X-Forwarded-For` header
+        // is the real origin.
+        // https://stackoverflow.com/a/18517550/893113
+        req.ip = req.headers['x-forwarded-for'].split(', ').pop()
+      } else if (isOnFly()) {
+        // On Fly we can use the Fly-Client-IP header
+        // https://fly.io/docs/reference/runtime-environment/#request-headers
+        req.ip = req.headers['fly-client-ip']
+          ? req.headers['fly-client-ip']
+          : req.socket.remoteAddress
+      } else {
+        req.ip = req.socket.remoteAddress
+      }
       next()
     })
     addHandlerAtIndex(this.camp, 1, cloudflareMiddleware())
@@ -342,32 +378,35 @@ class Server {
       makeSend(
         'svg',
         request.res,
-        end
+        end,
       )(
         makeBadge({
           label: '410',
           message: `${format} no longer available`,
           color: 'lightgray',
           format: 'svg',
-        })
+        }),
       )
     })
 
     if (!rasterUrl) {
-      camp.route(/\.png$/, (query, match, end, request) => {
-        makeSend(
-          'svg',
-          request.res,
-          end
-        )(
-          makeBadge({
-            label: '404',
-            message: 'raster badges not available',
-            color: 'lightgray',
-            format: 'svg',
-          })
-        )
-      })
+      camp.route(
+        /^\/((?!img|assets\/)).*\.png$/,
+        (query, match, end, request) => {
+          makeSend(
+            'svg',
+            request.res,
+            end,
+          )(
+            makeBadge({
+              label: '404',
+              message: 'raster badges not available',
+              color: 'lightgray',
+              format: 'svg',
+            }),
+          )
+        },
+      )
     }
 
     camp.notfound(/(\.svg|\.json|)$/, (query, match, end, request) => {
@@ -377,14 +416,14 @@ class Server {
       makeSend(
         format,
         request.res,
-        end
+        end,
       )(
         makeBadge({
           label: '404',
           message: 'badge not found',
           color: 'red',
           format,
-        })
+        }),
       )
     })
   }
@@ -404,18 +443,21 @@ class Server {
 
     if (rasterUrl) {
       // Redirect to the raster server for raster versions of modern badges.
-      camp.route(/\.png$/, (queryParams, match, end, ask) => {
-        ask.res.statusCode = 301
-        ask.res.setHeader(
-          'Location',
-          rasterRedirectUrl({ rasterUrl }, ask.req.url)
-        )
+      camp.route(
+        /^\/((?!img|assets\/)).*\.png$/,
+        (queryParams, match, end, ask) => {
+          ask.res.statusCode = 301
+          ask.res.setHeader(
+            'Location',
+            rasterRedirectUrl({ rasterUrl }, ask.req.url),
+          )
 
-        const cacheDuration = (30 * 24 * 3600) | 0 // 30 days.
-        ask.res.setHeader('Cache-Control', `max-age=${cacheDuration}`)
+          const cacheDuration = (30 * 24 * 3600) | 0 // 30 days.
+          ask.res.setHeader('Cache-Control', `max-age=${cacheDuration}`)
 
-        ask.res.end()
-      })
+          ask.res.end()
+        },
+      )
     }
 
     if (redirectUrl) {
@@ -431,22 +473,28 @@ class Server {
    * Iterate all the service classes defined in /services,
    * load each service and register a Scoutcamp route for each service.
    */
-  registerServices() {
+  async registerServices() {
     const { config, camp, metricInstance } = this
     const { apiProvider: githubApiProvider } = this.githubConstellation
-
-    loadServiceClasses().forEach(serviceClass =>
+    const { apiProvider: librariesIoApiProvider } =
+      this.librariesioConstellation
+    ;(await loadServiceClasses()).forEach(serviceClass =>
       serviceClass.register(
-        { camp, handleRequest, githubApiProvider, metricInstance },
+        {
+          camp,
+          handleRequest,
+          githubApiProvider,
+          librariesIoApiProvider,
+          metricInstance,
+        },
         {
           handleInternalErrors: config.public.handleInternalErrors,
           cacheHeaders: config.public.cacheHeaders,
-          fetchLimitBytes: bytes(config.public.fetchLimit),
           rasterUrl: config.public.rasterUrl,
           private: config.private,
           public: config.public,
-        }
-      )
+        },
+      ),
     )
   }
 
@@ -479,14 +527,12 @@ class Server {
     const {
       bind: { port, address: hostname },
       ssl: { isSecure: secure, cert, key },
-      cors: { allowedOrigin },
-      rateLimit,
       requireCloudflare,
     } = this.config.public
 
     this.bootstrapAgent()
 
-    log(`Server is starting up: ${this.baseUrl}`)
+    log.log(`Server is starting up: ${this.baseUrl}`)
 
     const camp = (this.camp = Camp.create({
       documentRoot: this.config.public.documentRoot,
@@ -502,13 +548,7 @@ class Server {
       this.requireCloudflare()
     }
 
-    const { metricInstance } = this
-    this.cleanupMonitor = sysMonitor.setRoutes(
-      { rateLimit },
-      { server: camp, metricInstance }
-    )
-
-    const { githubConstellation } = this
+    const { githubConstellation, metricInstance } = this
     await githubConstellation.initialize(camp)
     if (metricInstance) {
       if (this.config.public.metrics.prometheus.endpointEnabled) {
@@ -519,13 +559,29 @@ class Server {
       }
     }
 
-    const { apiProvider: githubApiProvider } = this.githubConstellation
-    suggest.setRoutes(allowedOrigin, githubApiProvider, camp)
+    // https://github.com/badges/shields/issues/3273
+    camp.handle((req, res, next) => {
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      next()
+    })
 
     this.registerErrorHandlers()
     this.registerRedirects()
-    this.registerServices()
+    await this.registerServices()
 
+    camp.timeout = this.config.public.requestTimeoutSeconds * 1000
+    if (this.config.public.requestTimeoutSeconds > 0) {
+      camp.on('timeout', socket => {
+        const maxAge = this.config.public.requestTimeoutMaxAgeSeconds
+        socket.write('HTTP/1.1 408 Request Timeout\r\n')
+        socket.write('Content-Type: text/html; charset=UTF-8\r\n')
+        socket.write('Content-Encoding: UTF-8\r\n')
+        socket.write(`Cache-Control: max-age=${maxAge}, s-maxage=${maxAge}\r\n`)
+        socket.write('Connection: close\r\n\r\n')
+        socket.write('Request Timeout')
+        socket.end()
+      })
+    }
     camp.listenAsConfigured()
 
     await new Promise(resolve => camp.on('listening', () => resolve()))
@@ -534,7 +590,7 @@ class Server {
   static resetGlobalState() {
     // This state should be migrated to instance state. When possible, do not add new
     // global state.
-    clearRegularUpdateCache()
+    clearResourceCache()
   }
 
   reset() {
@@ -569,7 +625,7 @@ class Server {
   }
 }
 
-module.exports = Server
+export default Server
 </code></pre>
         </article>
     </section>
@@ -580,13 +636,13 @@ module.exports = Server
 </div>
 
 <nav>
-    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-badge-maker.html">badge-maker</a></li><li><a href="module-core_base-service_base.html">core/base-service/base</a></li><li><a href="module-core_base-service_base-graphql.html">core/base-service/base-graphql</a></li><li><a href="module-core_base-service_base-json.html">core/base-service/base-json</a></li><li><a href="module-core_base-service_base-svg-scraping.html">core/base-service/base-svg-scraping</a></li><li><a href="module-core_base-service_base-xml.html">core/base-service/base-xml</a></li><li><a href="module-core_base-service_base-yaml.html">core/base-service/base-yaml</a></li><li><a href="module-core_base-service_errors.html">core/base-service/errors</a></li><li><a href="module-core_base-service_graphql.html">core/base-service/graphql</a></li><li><a href="module-core_server_server.html">core/server/server</a></li><li><a href="module-core_service-test-runner_create-service-tester.html">core/service-test-runner/create-service-tester</a></li><li><a href="module-core_service-test-runner_icedfrisby-shields.html">core/service-test-runner/icedfrisby-shields</a></li><li><a href="module-core_service-test-runner_infer-pull-request.html">core/service-test-runner/infer-pull-request</a></li><li><a href="module-core_service-test-runner_runner.html">core/service-test-runner/runner</a></li><li><a href="module-core_service-test-runner_service-tester.html">core/service-test-runner/service-tester</a></li><li><a href="module-core_service-test-runner_services-for-title.html">core/service-test-runner/services-for-title</a></li><li><a href="module-core_token-pooling_token-pool.html">core/token-pooling/token-pool</a></li><li><a href="module-services_dynamic_json-path.html">services/dynamic/json-path</a></li><li><a href="module-services_steam_steam-base.html">services/steam/steam-base</a></li></ul><h3>Classes</h3><ul><li><a href="module.exports.html">exports</a></li><li><a href="module-core_base-service_base-graphql-BaseGraphqlService.html">BaseGraphqlService</a></li><li><a href="module-core_base-service_base-json-BaseJsonService.html">BaseJsonService</a></li><li><a href="module-core_base-service_base-svg-scraping-BaseSvgScrapingService.html">BaseSvgScrapingService</a></li><li><a href="module-core_base-service_base-xml-BaseXmlService.html">BaseXmlService</a></li><li><a href="module-core_base-service_base-yaml-BaseYamlService.html">BaseYamlService</a></li><li><a href="module-core_base-service_base-BaseService.html">BaseService</a></li><li><a href="module-core_base-service_errors-Deprecated.html">Deprecated</a></li><li><a href="module-core_base-service_errors-ImproperlyConfigured.html">ImproperlyConfigured</a></li><li><a href="module-core_base-service_errors-Inaccessible.html">Inaccessible</a></li><li><a href="module-core_base-service_errors-InvalidParameter.html">InvalidParameter</a></li><li><a href="module-core_base-service_errors-InvalidResponse.html">InvalidResponse</a></li><li><a href="module-core_base-service_errors-NotFound.html">NotFound</a></li><li><a href="module-core_base-service_errors-ShieldsRuntimeError.html">ShieldsRuntimeError</a></li><li><a href="module-core_server_server-Server.html">Server</a></li><li><a href="module-core_service-test-runner_runner-Runner.html">Runner</a></li><li><a href="module-core_service-test-runner_service-tester-ServiceTester.html">ServiceTester</a></li><li><a href="module-core_token-pooling_token-pool-Token.html">Token</a></li><li><a href="module-core_token-pooling_token-pool-TokenPool.html">TokenPool</a></li><li><a href="module-services_steam_steam-base-BaseSteamAPI.html">BaseSteamAPI</a></li></ul><h3>Tutorials</h3><ul><li><a href="tutorial-TUTORIAL.html">TUTORIAL</a></li><li><a href="tutorial-badge-urls.html">badge-urls</a></li><li><a href="tutorial-code-walkthrough.html">code-walkthrough</a></li><li><a href="tutorial-deprecating-badges.html">deprecating-badges</a></li><li><a href="tutorial-input-validation.html">input-validation</a></li><li><a href="tutorial-json-format.html">json-format</a></li><li><a href="tutorial-logos.html">logos</a></li><li><a href="tutorial-performance-testing.html">performance-testing</a></li><li><a href="tutorial-production-hosting.html">production-hosting</a></li><li><a href="tutorial-rewriting-services.html">rewriting-services</a></li><li><a href="tutorial-self-hosting.html">self-hosting</a></li><li><a href="tutorial-server-secrets.html">server-secrets</a></li><li><a href="tutorial-service-tests.html">service-tests</a></li><li><a href="tutorial-users.html">users</a></li></ul><h3>Global</h3><ul><li><a href="global.html#validateAffiliations">validateAffiliations</a></li></ul>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="module-badge-maker.html">badge-maker</a></li><li><a href="module-badge-maker_lib_xml.html">badge-maker/lib/xml</a></li><li><a href="module-core_base-service_base.html">core/base-service/base</a></li><li><a href="module-core_base-service_base-graphql.html">core/base-service/base-graphql</a></li><li><a href="module-core_base-service_base-json.html">core/base-service/base-json</a></li><li><a href="module-core_base-service_base-svg-scraping.html">core/base-service/base-svg-scraping</a></li><li><a href="module-core_base-service_base-xml.html">core/base-service/base-xml</a></li><li><a href="module-core_base-service_base-yaml.html">core/base-service/base-yaml</a></li><li><a href="module-core_base-service_errors.html">core/base-service/errors</a></li><li><a href="module-core_base-service_graphql.html">core/base-service/graphql</a></li><li><a href="module-core_base-service_openapi.html">core/base-service/openapi</a></li><li><a href="module-core_base-service_resource-cache.html">core/base-service/resource-cache</a></li><li><a href="module-core_server_server.html">core/server/server</a></li><li><a href="module-core_service-test-runner_create-service-tester.html">core/service-test-runner/create-service-tester</a></li><li><a href="module-core_service-test-runner_icedfrisby-shields.html">core/service-test-runner/icedfrisby-shields</a></li><li><a href="module-core_service-test-runner_runner.html">core/service-test-runner/runner</a></li><li><a href="module-core_service-test-runner_service-tester.html">core/service-test-runner/service-tester</a></li><li><a href="module-core_service-test-runner_services-for-title.html">core/service-test-runner/services-for-title</a></li><li><a href="module-core_token-pooling_token-pool.html">core/token-pooling/token-pool</a></li><li><a href="module-services_build-status.html">services/build-status</a></li><li><a href="module-services_color-formatters.html">services/color-formatters</a></li><li><a href="module-services_contributor-count.html">services/contributor-count</a></li><li><a href="module-services_downloads.html">services/downloads</a></li><li><a href="module-services_dynamic-common.html">services/dynamic-common</a></li><li><a href="module-services_dynamic_json-path.html">services/dynamic/json-path</a></li><li><a href="module-services_endpoint-common.html">services/endpoint-common</a></li><li><a href="module-services_licenses.html">services/licenses</a></li><li><a href="module-services_package-json-helpers.html">services/package-json-helpers</a></li><li><a href="module-services_php-version.html">services/php-version</a></li><li><a href="module-services_pipenv-helpers.html">services/pipenv-helpers</a></li><li><a href="module-services_route-builder.html">services/route-builder</a></li><li><a href="module-services_steam_steam-base.html">services/steam/steam-base</a></li><li><a href="module-services_text-formatters.html">services/text-formatters</a></li><li><a href="module-services_validators.html">services/validators</a></li></ul><h3>Classes</h3><ul><li><a href="module-badge-maker_lib_xml-ElementList.html">ElementList</a></li><li><a href="module-badge-maker_lib_xml-XmlElement.html">XmlElement</a></li><li><a href="module-core_base-service_base-graphql-BaseGraphqlService.html">BaseGraphqlService</a></li><li><a href="module-core_base-service_base-json-BaseJsonService.html">BaseJsonService</a></li><li><a href="module-core_base-service_base-svg-scraping-BaseSvgScrapingService.html">BaseSvgScrapingService</a></li><li><a href="module-core_base-service_base-xml-BaseXmlService.html">BaseXmlService</a></li><li><a href="module-core_base-service_base-yaml-BaseYamlService.html">BaseYamlService</a></li><li><a href="module-core_base-service_base-BaseService.html">BaseService</a></li><li><a href="module-core_base-service_errors-Deprecated.html">Deprecated</a></li><li><a href="module-core_base-service_errors-ImproperlyConfigured.html">ImproperlyConfigured</a></li><li><a href="module-core_base-service_errors-Inaccessible.html">Inaccessible</a></li><li><a href="module-core_base-service_errors-InvalidParameter.html">InvalidParameter</a></li><li><a href="module-core_base-service_errors-InvalidResponse.html">InvalidResponse</a></li><li><a href="module-core_base-service_errors-NotFound.html">NotFound</a></li><li><a href="module-core_base-service_errors-ShieldsRuntimeError.html">ShieldsRuntimeError</a></li><li><a href="module-core_server_server-Server.html">Server</a></li><li><a href="module-core_service-test-runner_runner-Runner.html">Runner</a></li><li><a href="module-core_service-test-runner_service-tester-ServiceTester.html">ServiceTester</a></li><li><a href="module-core_token-pooling_token-pool-Token.html">Token</a></li><li><a href="module-core_token-pooling_token-pool-TokenPool.html">TokenPool</a></li><li><a href="module-services_route-builder.html">services/route-builder</a></li><li><a href="module-services_steam_steam-base-BaseSteamAPI.html">BaseSteamAPI</a></li></ul><h3>Tutorials</h3><ul><li><a href="tutorial-TUTORIAL.html">TUTORIAL</a></li><li><a href="tutorial-adding-new-config-values.html">adding-new-config-values</a></li><li><a href="tutorial-authentication.html">authentication</a></li><li><a href="tutorial-badge-urls.html">badge-urls</a></li><li><a href="tutorial-code-walkthrough.html">code-walkthrough</a></li><li><a href="tutorial-deprecating-badges.html">deprecating-badges</a></li><li><a href="tutorial-input-validation.html">input-validation</a></li><li><a href="tutorial-json-format.html">json-format</a></li><li><a href="tutorial-logos.html">logos</a></li><li><a href="tutorial-performance-testing.html">performance-testing</a></li><li><a href="tutorial-production-hosting.html">production-hosting</a></li><li><a href="tutorial-releases.html">releases</a></li><li><a href="tutorial-self-hosting.html">self-hosting</a></li><li><a href="tutorial-server-secrets.html">server-secrets</a></li><li><a href="tutorial-service-tests.html">service-tests</a></li><li><a href="tutorial-static-badges.html">static-badges</a></li></ul><h3>Global</h3><ul><li><a href="global.html#createNumRequestCounter">createNumRequestCounter</a></li><li><a href="global.html#isMetricWithPattern">isMetricWithPattern</a></li></ul>
 </nav>
 
 <br class="clear">
 
 <footer>
-    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.6</a> on Fri Mar 12 2021 21:01:22 GMT+0000 (Coordinated Universal Time)
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 4.0.2</a> on Wed Aug 09 2023 10:05:57 GMT+0000 (Coordinated Universal Time)
 </footer>
 
 <script> prettyPrint(); </script>
